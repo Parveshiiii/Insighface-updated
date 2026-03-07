@@ -6,6 +6,19 @@ This is a fork of the [original InsightFace](https://github.com/deepinsight/insi
 
 ---
 
+## Credits
+
+All modifications to this fork were designed and implemented by **Parvesh** ([@Parveshiiii](https://github.com/Parveshiiii)):
+
+- ⚡ **GPU Batch Embedding** — Designed the `get_batch()` architecture to process N faces in a single ONNX Runtime GPU call instead of N sequential calls
+- 🔄 **FaceAnalysis Integration** — Updated `FaceAnalysis.get()` to automatically leverage `get_batch()` when available, with seamless fallback
+- 🧠 **Cross-Image Batching Pattern** — Pioneered the Phase 1 (detect+align) / Phase 2 (batch GPU inference) pipeline for processing faces across multiple images simultaneously
+- 🔧 **FutureWarning Fix** — Updated deprecated `SimilarityTransform.estimate()` to `SimilarityTransform.from_estimate()`
+
+> *README written by AI, modifications by Parvesh.*
+
+---
+
 ## What's Changed
 
 | File | Change |
