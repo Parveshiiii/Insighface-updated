@@ -149,7 +149,20 @@ class RetinaFace:
         kpss_list = []
         input_size = tuple(img.shape[0:2][::-1])
         blob = cv2.dnn.blobFromImage(img, 1.0/self.input_std, input_size, (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
-        net_outs = self.session.run(self.output_names, {self.input_name : blob})
+        
+        # ── Use IOBinding for zero-copy output allocation ──
+        providers = self.session.get_providers()
+        use_io_binding = any(p in providers for p in ('CUDAExecutionProvider', 'TensorrtExecutionProvider'))
+        
+        if use_io_binding:
+            io_binding = self.session.io_binding()
+            io_binding.bind_cpu_input(self.input_name, blob)
+            for name in self.output_names:
+                io_binding.bind_output(name)
+            self.session.run_with_iobinding(io_binding)
+            net_outs = io_binding.copy_outputs_to_cpu()
+        else:
+            net_outs = self.session.run(self.output_names, {self.input_name : blob})
 
         input_height = blob.shape[2]
         input_width = blob.shape[3]

@@ -37,6 +37,13 @@ class ModelRouter:
         self.onnx_file = onnx_file
 
     def get_model(self, **kwargs):
+        if 'sess_options' not in kwargs and 'session' not in kwargs:
+            opts = onnxruntime.SessionOptions()
+            opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.enable_mem_pattern = True
+            opts.enable_mem_reuse = True
+            kwargs['sess_options'] = opts
+            
         session = PickableInferenceSession(self.onnx_file, **kwargs)
         print(f'Applied providers: {session._providers}, with options: {session._provider_options}')
         inputs = session.get_inputs()
@@ -46,6 +53,9 @@ class ModelRouter:
 
         if len(outputs)>=5:
             return RetinaFace(model_file=self.onnx_file, session=session)
+        elif input_shape[2]==input_shape[3] and input_shape[2]>=128 and len(outputs)==15: # SCRFD 10G/34G style
+            from .scrfd import SCRFD
+            return SCRFD(model_file=self.onnx_file, session=session)
         elif input_shape[2]==192 and input_shape[3]==192:
             return Landmark(model_file=self.onnx_file, session=session)
         elif input_shape[2]==96 and input_shape[3]==96:
@@ -71,7 +81,10 @@ def get_default_providers():
     return ['CUDAExecutionProvider', 'CPUExecutionProvider']
 
 def get_default_provider_options():
+    # None = let ONNX Runtime use its own default options per provider.
+    # Pass explicit options via config.json 'provider_options' when needed.
     return None
+
 
 def get_model(name, **kwargs):
     root = kwargs.get('root', '~/.insightface')

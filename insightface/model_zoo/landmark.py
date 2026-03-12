@@ -47,7 +47,11 @@ class Landmark:
         self.input_std = input_std
         #print('input mean and std:', model_file, self.input_mean, self.input_std)
         if self.session is None:
-            self.session = onnxruntime.InferenceSession(self.model_file, None)
+            opts = onnxruntime.SessionOptions()
+            opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.enable_mem_pattern = True
+            opts.enable_mem_reuse = True
+            self.session = onnxruntime.InferenceSession(self.model_file, opts)
         input_cfg = self.session.get_inputs()[0]
         input_shape = input_cfg.shape
         input_name = input_cfg.name
@@ -62,7 +66,6 @@ class Landmark:
         assert len(self.output_names)==1
         output_shape = outputs[0].shape
         self.require_pose = False
-        #print('init output_shape:', output_shape)
         if output_shape[1]==3309:
             self.lmk_dim = 3
             self.lmk_num = 68
@@ -77,38 +80,81 @@ class Landmark:
         if ctx_id<0:
             self.session.set_providers(['CPUExecutionProvider'])
 
-    def get(self, img, face):
-        bbox = face.bbox
-        w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
-        center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
-        rotate = 0
-        _scale = self.input_size[0]  / (max(w, h)*1.5)
-        #print('param:', img.shape, bbox, center, self.input_size, _scale, rotate)
-        aimg, M = face_align.transform(img, center, self.input_size[0], _scale, rotate)
-        input_size = tuple(aimg.shape[0:2][::-1])
-        #assert input_size==self.input_size
-        blob = cv2.dnn.blobFromImage(aimg, 1.0/self.input_std, input_size, (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
-        pred = self.session.run(self.output_names, {self.input_name : blob})[0][0]
+    def _decode_pred(self, pred, M):
+        """Shared decode logic: reshape → scale → invert-transform."""
         if pred.shape[0] >= 3000:
             pred = pred.reshape((-1, 3))
         else:
             pred = pred.reshape((-1, 2))
         if self.lmk_num < pred.shape[0]:
-            pred = pred[self.lmk_num*-1:,:]
+            pred = pred[self.lmk_num * -1:, :]
         pred[:, 0:2] += 1
         pred[:, 0:2] *= (self.input_size[0] // 2)
         if pred.shape[1] == 3:
             pred[:, 2] *= (self.input_size[0] // 2)
-
         IM = cv2.invertAffineTransform(M)
-        pred = face_align.trans_points(pred, IM)
+        return face_align.trans_points(pred, IM)
+
+    def get(self, img, face):
+        bbox = face.bbox
+        w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+        center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
+        _scale = self.input_size[0] / (max(w, h) * 1.5)
+        aimg, M = face_align.transform(img, center, self.input_size[0], _scale, 0)
+        input_size = tuple(aimg.shape[0:2][::-1])
+        blob = cv2.dnn.blobFromImage(aimg, 1.0/self.input_std, input_size,
+                                     (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
+        pred = self.session.run(self.output_names, {self.input_name: blob})[0][0]
+        pred = self._decode_pred(pred, M)
         face[self.taskname] = pred
         if self.require_pose:
             P = transform.estimate_affine_matrix_3d23d(self.mean_lmk, pred)
             s, R, t = transform.P2sRt(P)
             rx, ry, rz = transform.matrix2angle(R)
-            pose = np.array( [rx, ry, rz], dtype=np.float32 )
-            face['pose'] = pose #pitch, yaw, roll
+            face['pose'] = np.array([rx, ry, rz], dtype=np.float32)
         return pred
 
+    def get_batch(self, batch_items):
+        """
+        Process N faces in ONE ONNX session.run() call.
+        batch_items: list of (img, face_obj) tuples.
+        Populates face_obj[self.taskname] for each face in-place.
+        """
+        if not batch_items:
+            return
 
+        aimgs, Ms = [], []
+        for img, face in batch_items:
+            bbox = face.bbox
+            w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+            center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
+            _scale = self.input_size[0] / (max(w, h) * 1.5)
+            aimg, M = face_align.transform(img, center, self.input_size[0], _scale, 0)
+            aimgs.append(aimg)
+            Ms.append(M)
+
+        # Single GPU call for the entire batch → [N, 3, 192, 192]
+        blob = cv2.dnn.blobFromImages(aimgs, 1.0/self.input_std, self.input_size,
+                                      (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
+        
+        providers = self.session.get_providers()
+        use_io_binding = any(p in providers for p in ('CUDAExecutionProvider', 'TensorrtExecutionProvider'))
+
+        if use_io_binding:
+            io_binding = self.session.io_binding()
+            io_binding.bind_cpu_input(self.input_name, blob)
+            for name in self.output_names:
+                io_binding.bind_output(name)
+            self.session.run_with_iobinding(io_binding)
+            all_preds = io_binding.copy_outputs_to_cpu()[0]
+        else:
+            all_preds = self.session.run(self.output_names, {self.input_name: blob})[0]
+
+        for i, (img, face) in enumerate(batch_items):
+            pred = self._decode_pred(all_preds[i].copy(), Ms[i])
+            face[self.taskname] = pred
+            if self.require_pose:
+                P = transform.estimate_affine_matrix_3d23d(self.mean_lmk, pred)
+                s, R, t = transform.P2sRt(P)
+                rx, ry, rz = transform.matrix2angle(R)
+                face['pose'] = np.array([rx, ry, rz], dtype=np.float32)

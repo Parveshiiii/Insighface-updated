@@ -69,26 +69,50 @@ class Attribute:
         if ctx_id<0:
             self.session.set_providers(['CPUExecutionProvider'])
 
-    def get(self, img, face):
-        bbox = face.bbox
-        w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
-        center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
-        rotate = 0
-        _scale = self.input_size[0]  / (max(w, h)*1.5)
-        #print('param:', img.shape, bbox, center, self.input_size, _scale, rotate)
-        aimg, M = face_align.transform(img, center, self.input_size[0], _scale, rotate)
-        input_size = tuple(aimg.shape[0:2][::-1])
-        #assert input_size==self.input_size
-        blob = cv2.dnn.blobFromImage(aimg, 1.0/self.input_std, input_size, (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
-        pred = self.session.run(self.output_names, {self.input_name : blob})[0][0]
-        if self.taskname=='genderage':
-            assert len(pred)==3
-            gender = np.argmax(pred[:2])
-            age = int(np.round(pred[2]*100))
-            face['gender'] = gender
-            face['age'] = age
-            return gender, age
+    def get_batch(self, batch_items):
+        if not batch_items:
+            return
+        
+        aimgs = []
+        for img, face in batch_items:
+            bbox = face.bbox
+            w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+            center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
+            _scale = self.input_size[0] / (max(w, h) * 1.5)
+            aimg, _ = face_align.transform(img, center, self.input_size[0], _scale, 0)
+            aimgs.append(aimg)
+            
+        blob = cv2.dnn.blobFromImages(aimgs, 1.0/self.input_std, self.input_size, 
+                                      (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
+        
+        providers = self.session.get_providers()
+        use_io_binding = any(p in providers for p in ('CUDAExecutionProvider', 'TensorrtExecutionProvider'))
+
+        if use_io_binding:
+            io_binding = self.session.io_binding()
+            io_binding.bind_cpu_input(self.input_name, blob)
+            for name in self.output_names:
+                io_binding.bind_output(name)
+            self.session.run_with_iobinding(io_binding)
+            all_preds = io_binding.copy_outputs_to_cpu()[0]
         else:
-            return pred
+            all_preds = self.session.run(self.output_names, {self.input_name: blob})[0]
+
+        for i, (img, face) in enumerate(batch_items):
+            pred = all_preds[i]
+            if self.taskname == 'genderage':
+                gender = np.argmax(pred[:2])
+                age = int(np.round(pred[2] * 100))
+                face['gender'] = gender
+                face['age'] = age
+            else:
+                face[self.taskname] = pred
+
+    def get(self, img, face):
+        self.get_batch([(img, face)])
+        if self.taskname == 'genderage':
+            return face['gender'], face['age']
+        else:
+            return face[self.taskname]
 
 

@@ -41,9 +41,14 @@ class ArcFaceONNX:
             input_std = 127.5
         self.input_mean = input_mean
         self.input_std = input_std
-        #print('input mean and std:', self.input_mean, self.input_std)
         if self.session is None:
-            self.session = onnxruntime.InferenceSession(self.model_file, None)
+            # ── Tuned SessionOptions for maximum throughput ──
+            opts = onnxruntime.SessionOptions()
+            opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.enable_mem_pattern = True
+            opts.enable_mem_reuse = True
+            opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+            self.session = onnxruntime.InferenceSession(self.model_file, opts)
         input_cfg = self.session.get_inputs()[0]
         input_shape = input_cfg.shape
         input_name = input_cfg.name
@@ -95,10 +100,23 @@ class ArcFaceONNX:
         if not isinstance(imgs, list):
             imgs = [imgs]
         input_size = self.input_size
-        
         blob = cv2.dnn.blobFromImages(imgs, 1.0 / self.input_std, input_size,
                                       (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
-        net_out = self.session.run(self.output_names, {self.input_name: blob})[0]
+        providers = self.session.get_providers()
+        use_io_binding = any(p in providers for p in ('CUDAExecutionProvider', 'TensorrtExecutionProvider'))
+
+        if use_io_binding:
+            import numpy as np
+            io_binding = self.session.io_binding()
+            blob_ortvalue = onnxruntime.OrtValue.ortvalue_from_numpy(blob, 'cuda', 0)
+            io_binding.bind_ortvalue_input(self.input_name, blob_ortvalue)
+            for out_name in self.output_names:
+                io_binding.bind_output(out_name, 'cuda')
+            self.session.run_with_iobinding(io_binding)
+            net_out = io_binding.get_outputs()[0].numpy()
+        else:
+            net_out = self.session.run(self.output_names, {self.input_name: blob})[0]
+
         return net_out
 
     def forward(self, batch_data):
